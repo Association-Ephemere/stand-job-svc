@@ -67,6 +67,8 @@ builder.Services.AddSingleton<INpgsqlConnectionFactory, NpgsqlConnectionFactory>
 builder.Services.AddSingleton(_ => Channel.CreateUnbounded<StatusUpdate>());
 builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<StatusUpdate>>().Writer);
 builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<StatusUpdate>>().Reader);
+builder.Services.AddSingleton<StatusUpdateBroadcaster>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<StatusUpdateBroadcaster>());
 builder.Services.AddHostedService<JobStatusListener>();
 
 builder.Services.AddOptions<MinioOptions>()
@@ -80,11 +82,24 @@ builder.Services.AddSingleton<IMinioClient>(sp =>
     return new MinioClient()
         .WithEndpoint(opts.Endpoint)
         .WithCredentials(opts.AccessKey, opts.SecretKey)
+        .WithRegion(opts.Region)
         .WithSSL(opts.UseSSL)
         .Build();
 });
 builder.Services.AddSingleton<IBucketOperations>(sp => (IBucketOperations)sp.GetRequiredService<IMinioClient>());
-builder.Services.AddSingleton<IObjectOperations>(sp => (IObjectOperations)sp.GetRequiredService<IMinioClient>());
+builder.Services.AddSingleton<IObjectOperations>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<MinioOptions>>().Value;
+    if (string.IsNullOrWhiteSpace(opts.PublicEndpoint) || opts.PublicEndpoint == opts.Endpoint)
+        return (IObjectOperations)sp.GetRequiredService<IMinioClient>();
+
+    return (IObjectOperations)new MinioClient()
+        .WithEndpoint(opts.PublicEndpoint)
+        .WithCredentials(opts.AccessKey, opts.SecretKey)
+        .WithRegion(opts.Region)
+        .WithSSL(opts.UseSSL)
+        .Build();
+});
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -318,7 +333,11 @@ app.MapGet("/photos", async (
             allItems.Add((item.Key, item.LastModifiedDateTime));
     }
 
-    allItems.Sort((a, b) => (b.LastModified ?? DateTime.MinValue).CompareTo(a.LastModified ?? DateTime.MinValue));
+    allItems.Sort((a, b) =>
+    {
+        var cmp = (b.LastModified ?? DateTime.MinValue).CompareTo(a.LastModified ?? DateTime.MinValue);
+        return cmp != 0 ? cmp : StringComparer.Ordinal.Compare(a.Key, b.Key);
+    });
     var allKeys = allItems.Select(i => i.Key).ToList();
     var total = allKeys.Count;
     var page = allKeys.Skip(effectiveOffset).Take(effectiveLimit).ToList();
@@ -341,44 +360,52 @@ var sseOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPo
 app.MapGet("/jobs/{jobId:guid}/stream", async (
     Guid jobId,
     JobDbContext db,
-    ChannelReader<StatusUpdate> reader,
+    StatusUpdateBroadcaster broadcaster,
     HttpResponse response,
     CancellationToken ct) =>
 {
-    var job = await db.Jobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId, ct);
-    if (job is null)
-        return Results.NotFound();
-
-    response.ContentType = "text/event-stream";
-    response.Headers["Cache-Control"] = "no-cache";
-    response.Headers["X-Accel-Buffering"] = "no";
-
-    var initial = new StatusUpdate(
-        jobId.ToString(),
-        job.Status.ToString().ToLower(),
-        job.Printed,
-        job.Total,
-        job.Error);
-
-    await WriteSseEventAsync(response, initial, ct);
-
-    if (initial.Status is "done" or "error")
-        return Results.Empty;
-
-    var jobIdStr = jobId.ToString();
-
-    await foreach (var update in reader.ReadAllAsync(ct))
+    var (subscriptionId, reader) = broadcaster.Subscribe();
+    try
     {
-        if (update.JobId != jobIdStr)
-            continue;
+        var job = await db.Jobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId, ct);
+        if (job is null)
+            return Results.NotFound();
 
-        await WriteSseEventAsync(response, update, ct);
+        response.ContentType = "text/event-stream";
+        response.Headers["Cache-Control"] = "no-cache";
+        response.Headers["X-Accel-Buffering"] = "no";
 
-        if (update.Status is "done" or "error")
-            break;
+        var initial = new StatusUpdate(
+            jobId.ToString(),
+            job.Status.ToString().ToLower(),
+            job.Printed,
+            job.Total,
+            job.Error);
+
+        await WriteSseEventAsync(response, initial, ct);
+
+        if (initial.Status is "done" or "error")
+            return Results.Empty;
+
+        var jobIdStr = jobId.ToString();
+
+        await foreach (var update in reader.ReadAllAsync(ct))
+        {
+            if (update.JobId != jobIdStr)
+                continue;
+
+            await WriteSseEventAsync(response, update, ct);
+
+            if (update.Status is "done" or "error")
+                break;
+        }
+
+        return Results.Empty;
     }
-
-    return Results.Empty;
+    finally
+    {
+        broadcaster.Unsubscribe(subscriptionId);
+    }
 });
 
 app.Run();
