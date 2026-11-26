@@ -219,4 +219,37 @@ public class SseEndpointTests : IDisposable
         Assert.Contains("\"status\":\"done\"", dataLine);
         Assert.Contains(job.Id.ToString(), dataLine);
     }
+
+    [Fact]
+    public async Task Stream_MultipleClients_AllReceiveUpdate()
+    {
+        var factory = CreateFactory();
+        var job = new Job { Status = JobStatus.Printing, Total = 3, Printed = 1 };
+        await SeedAsync(factory, job);
+
+        var statusChannel = factory.Services.GetRequiredService<Channel<StatusUpdate>>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var client1 = factory.CreateClient();
+        var client2 = factory.CreateClient();
+
+        using var response1 = await client1.GetAsync($"/jobs/{job.Id}/stream", HttpCompletionOption.ResponseHeadersRead, cts.Token);
+        using var response2 = await client2.GetAsync($"/jobs/{job.Id}/stream", HttpCompletionOption.ResponseHeadersRead, cts.Token);
+
+        using var reader1 = new StreamReader(await response1.Content.ReadAsStreamAsync(cts.Token));
+        using var reader2 = new StreamReader(await response2.Content.ReadAsStreamAsync(cts.Token));
+
+        // Consume initial events on both clients
+        await reader1.ReadLineAsync(cts.Token);
+        await reader1.ReadLineAsync(cts.Token);
+        await reader2.ReadLineAsync(cts.Token);
+        await reader2.ReadLineAsync(cts.Token);
+
+        statusChannel.Writer.TryWrite(new StatusUpdate(job.Id.ToString(), "done", 3, 3, null));
+
+        var line1 = await reader1.ReadLineAsync(cts.Token);
+        var line2 = await reader2.ReadLineAsync(cts.Token);
+
+        Assert.Contains("\"status\":\"done\"", line1);
+        Assert.Contains("\"status\":\"done\"", line2);
+    }
 }

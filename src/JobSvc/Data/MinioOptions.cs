@@ -9,6 +9,10 @@ public class MinioOptions
     [Required]
     public string Endpoint { get; set; } = string.Empty;
 
+    public string? PublicEndpoint { get; set; }
+
+    public string Region { get; set; } = "us-east-1";
+
     [Required]
     public string AccessKey { get; set; } = string.Empty;
 
